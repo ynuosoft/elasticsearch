@@ -1,0 +1,18 @@
+plugins {
+    id 'java'
+}
+
+group = 'org.elasticsearch.examples'
+version = 'unspecified'
+
+repositories {
+    mavenCentral()
+}
+
+dependencies {
+
+}
+
+test {
+    useJUnitPlatform()
+}
