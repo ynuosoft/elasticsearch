@@ -29,6 +29,7 @@ import org.elasticsearch.xcontent.XContentBuilder;
 import org.elasticsearch.xcontent.XContentParser;
 import org.elasticsearch.xpack.core.ml.MlConfigVersion;
 import org.elasticsearch.xpack.core.ml.inference.TrainedModelConfig;
+import org.elasticsearch.xpack.core.ml.inference.assignment.AdaptiveAllocationsFeatureFlag;
 import org.elasticsearch.xpack.core.ml.inference.assignment.AdaptiveAllocationsSettings;
 import org.elasticsearch.xpack.core.ml.inference.assignment.AllocationStatus;
 import org.elasticsearch.xpack.core.ml.inference.assignment.Priority;
@@ -119,12 +120,14 @@ public class StartTrainedModelDeploymentAction extends ActionType<CreateTrainedM
                 ObjectParser.ValueType.VALUE
             );
             PARSER.declareString(Request::setPriority, PRIORITY);
-            PARSER.declareObjectOrNull(
-                Request::setAdaptiveAllocationsSettings,
-                (p, c) -> AdaptiveAllocationsSettings.PARSER.parse(p, c).build(),
-                null,
-                ADAPTIVE_ALLOCATIONS
-            );
+            if (AdaptiveAllocationsFeatureFlag.isEnabled()) {
+                PARSER.declareObjectOrNull(
+                    Request::setAdaptiveAllocationsSettings,
+                    (p, c) -> AdaptiveAllocationsSettings.PARSER.parse(p, c).build(),
+                    null,
+                    ADAPTIVE_ALLOCATIONS
+                );
+            }
         }
 
         public static Request parseRequest(String modelId, String deploymentId, XContentParser parser) {
@@ -617,6 +620,9 @@ public class StartTrainedModelDeploymentAction extends ActionType<CreateTrainedM
             return deploymentId;
         }
 
+        /**
+         * @return the estimated memory (in bytes) required for the model deployment to run
+         */
         public long estimateMemoryUsageBytes() {
             // We already take into account 2x the model bytes. If the cache size is larger than the model bytes, then
             // we need to take it into account when returning the estimate.
@@ -726,10 +732,16 @@ public class StartTrainedModelDeploymentAction extends ActionType<CreateTrainedM
             return modelBytes;
         }
 
+        /**
+         * @return the number of threads per allocation used by the model during inference. each thread requires one processor.
+         */
         public int getThreadsPerAllocation() {
             return threadsPerAllocation;
         }
 
+        /**
+         * @return the number of allocations requested by the user
+         */
         public int getNumberOfAllocations() {
             return numberOfAllocations;
         }
