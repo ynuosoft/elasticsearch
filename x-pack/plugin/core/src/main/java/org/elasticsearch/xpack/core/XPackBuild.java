@@ -9,13 +9,9 @@ package org.elasticsearch.xpack.core;
 import org.elasticsearch.core.PathUtils;
 import org.elasticsearch.core.SuppressForbidden;
 
-import java.io.IOException;
 import java.net.URISyntaxException;
 import java.net.URL;
-import java.nio.file.Files;
 import java.nio.file.Path;
-import java.util.jar.JarInputStream;
-import java.util.jar.Manifest;
 
 /**
  * Information about the built version of x-pack that is running.
@@ -25,24 +21,8 @@ public class XPackBuild {
     public static final XPackBuild CURRENT;
 
     static {
-        final String shortHash;
-        final String date;
-
-        Path path = getElasticsearchCodebase();
-        if (path.toString().endsWith(".jar")) {
-            try (JarInputStream jar = new JarInputStream(Files.newInputStream(path))) {
-                Manifest manifest = jar.getManifest();
-                shortHash = manifest.getMainAttributes().getValue("Change");
-                date = manifest.getMainAttributes().getValue("Build-Date");
-            } catch (IOException e) {
-                throw new RuntimeException(e);
-            }
-        } else {
-            // not running from a jar (unit tests, IDE)
-            shortHash = "Unknown";
-            date = "Unknown";
-        }
-
+        String shortHash = "Unknown";
+        String date = "Unknown";
         CURRENT = new XPackBuild(shortHash, date);
     }
 
