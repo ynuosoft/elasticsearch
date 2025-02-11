@@ -9,10 +9,11 @@ package org.elasticsearch.compute.operator;
 
 import org.elasticsearch.TransportVersions;
 import org.elasticsearch.common.Strings;
+import org.elasticsearch.common.collect.Iterators;
 import org.elasticsearch.common.io.stream.StreamInput;
 import org.elasticsearch.common.io.stream.StreamOutput;
 import org.elasticsearch.common.io.stream.Writeable;
-import org.elasticsearch.common.xcontent.ChunkedToXContent;
+import org.elasticsearch.common.xcontent.ChunkedToXContentHelper;
 import org.elasticsearch.common.xcontent.ChunkedToXContentObject;
 import org.elasticsearch.core.TimeValue;
 import org.elasticsearch.xcontent.ToXContent;
@@ -26,6 +27,13 @@ import java.util.Objects;
  * Profile results from a single {@link Driver}.
  */
 public class DriverProfile implements Writeable, ChunkedToXContentObject {
+    /**
+     * Description of the task this driver is running. This description should be
+     * short and meaningful as a grouping identifier. We use the phase of the
+     * query right now: "data", "node_reduce", "final".
+     */
+    private final String taskDescription;
+
     /**
      * Millis since epoch when the driver started.
      */
@@ -61,6 +69,7 @@ public class DriverProfile implements Writeable, ChunkedToXContentObject {
     private final DriverSleeps sleeps;
 
     public DriverProfile(
+        String taskDescription,
         long startMillis,
         long stopMillis,
         long tookNanos,
@@ -69,6 +78,7 @@ public class DriverProfile implements Writeable, ChunkedToXContentObject {
         List<DriverStatus.OperatorStatus> operators,
         DriverSleeps sleeps
     ) {
+        this.taskDescription = taskDescription;
         this.startMillis = startMillis;
         this.stopMillis = stopMillis;
         this.tookNanos = tookNanos;
@@ -79,6 +89,12 @@ public class DriverProfile implements Writeable, ChunkedToXContentObject {
     }
 
     public DriverProfile(StreamInput in) throws IOException {
+        if (in.getTransportVersion().onOrAfter(TransportVersions.ESQL_DRIVER_TASK_DESCRIPTION)
+            || in.getTransportVersion().isPatchFrom(TransportVersions.ESQL_DRIVER_TASK_DESCRIPTION_90)) {
+            this.taskDescription = in.readString();
+        } else {
+            this.taskDescription = "";
+        }
         if (in.getTransportVersion().onOrAfter(TransportVersions.V_8_16_0)) {
             this.startMillis = in.readVLong();
             this.stopMillis = in.readVLong();
@@ -101,6 +117,10 @@ public class DriverProfile implements Writeable, ChunkedToXContentObject {
 
     @Override
     public void writeTo(StreamOutput out) throws IOException {
+        if (out.getTransportVersion().onOrAfter(TransportVersions.ESQL_DRIVER_TASK_DESCRIPTION)
+            || out.getTransportVersion().isPatchFrom(TransportVersions.ESQL_DRIVER_TASK_DESCRIPTION_90)) {
+            out.writeString(taskDescription);
+        }
         if (out.getTransportVersion().onOrAfter(TransportVersions.V_8_16_0)) {
             out.writeVLong(startMillis);
             out.writeVLong(stopMillis);
@@ -112,6 +132,13 @@ public class DriverProfile implements Writeable, ChunkedToXContentObject {
         }
         out.writeCollection(operators);
         sleeps.writeTo(out);
+    }
+
+    /**
+     * Description of the task this driver is running.
+     */
+    public String taskDescription() {
+        return taskDescription;
     }
 
     /**
@@ -167,24 +194,25 @@ public class DriverProfile implements Writeable, ChunkedToXContentObject {
 
     @Override
     public Iterator<? extends ToXContent> toXContentChunked(ToXContent.Params params) {
-        return ChunkedToXContent.builder(params).object(ob -> {
-            ob.append((b, p) -> {
-                b.timestampFieldsFromUnixEpochMillis("start_millis", "start", startMillis);
-                b.timestampFieldsFromUnixEpochMillis("stop_millis", "stop", stopMillis);
-                b.field("took_nanos", tookNanos);
-                if (b.humanReadable()) {
-                    b.field("took_time", TimeValue.timeValueNanos(tookNanos));
-                }
-                b.field("cpu_nanos", cpuNanos);
-                if (b.humanReadable()) {
-                    b.field("cpu_time", TimeValue.timeValueNanos(cpuNanos));
-                }
-                b.field("iterations", iterations);
-                return b;
-            });
-            ob.array("operators", operators.iterator());
-            ob.field("sleeps", sleeps);
-        });
+        return Iterators.concat(ChunkedToXContentHelper.startObject(), Iterators.single((b, p) -> {
+            b.field("task_description", taskDescription);
+            b.timestampFieldsFromUnixEpochMillis("start_millis", "start", startMillis);
+            b.timestampFieldsFromUnixEpochMillis("stop_millis", "stop", stopMillis);
+            b.field("took_nanos", tookNanos);
+            if (b.humanReadable()) {
+                b.field("took_time", TimeValue.timeValueNanos(tookNanos));
+            }
+            b.field("cpu_nanos", cpuNanos);
+            if (b.humanReadable()) {
+                b.field("cpu_time", TimeValue.timeValueNanos(cpuNanos));
+            }
+            b.field("iterations", iterations);
+            return b;
+        }),
+            ChunkedToXContentHelper.array("operators", operators.iterator()),
+            ChunkedToXContentHelper.chunk((b, p) -> b.field("sleeps", sleeps)),
+            ChunkedToXContentHelper.endObject()
+        );
     }
 
     @Override
@@ -196,7 +224,8 @@ public class DriverProfile implements Writeable, ChunkedToXContentObject {
             return false;
         }
         DriverProfile that = (DriverProfile) o;
-        return startMillis == that.startMillis
+        return taskDescription.equals(that.taskDescription)
+            && startMillis == that.startMillis
             && stopMillis == that.stopMillis
             && tookNanos == that.tookNanos
             && cpuNanos == that.cpuNanos
@@ -207,7 +236,7 @@ public class DriverProfile implements Writeable, ChunkedToXContentObject {
 
     @Override
     public int hashCode() {
-        return Objects.hash(startMillis, stopMillis, tookNanos, cpuNanos, iterations, operators, sleeps);
+        return Objects.hash(taskDescription, startMillis, stopMillis, tookNanos, cpuNanos, iterations, operators, sleeps);
     }
 
     @Override

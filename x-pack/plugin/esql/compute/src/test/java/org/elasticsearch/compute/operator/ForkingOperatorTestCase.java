@@ -14,13 +14,16 @@ import org.elasticsearch.common.settings.Settings;
 import org.elasticsearch.common.util.concurrent.EsExecutors;
 import org.elasticsearch.compute.aggregation.AggregatorMode;
 import org.elasticsearch.compute.data.BlockFactory;
-import org.elasticsearch.compute.data.BlockTestUtils;
 import org.elasticsearch.compute.data.Page;
-import org.elasticsearch.compute.data.TestBlockFactory;
 import org.elasticsearch.compute.operator.exchange.ExchangeSinkHandler;
 import org.elasticsearch.compute.operator.exchange.ExchangeSinkOperator;
 import org.elasticsearch.compute.operator.exchange.ExchangeSourceHandler;
 import org.elasticsearch.compute.operator.exchange.ExchangeSourceOperator;
+import org.elasticsearch.compute.test.BlockTestUtils;
+import org.elasticsearch.compute.test.CannedSourceOperator;
+import org.elasticsearch.compute.test.OperatorTestCase;
+import org.elasticsearch.compute.test.TestBlockFactory;
+import org.elasticsearch.compute.test.TestResultPageSinkOperator;
 import org.elasticsearch.core.Releasables;
 import org.elasticsearch.core.TimeValue;
 import org.elasticsearch.threadpool.FixedExecutorBuilder;
@@ -65,6 +68,7 @@ public abstract class ForkingOperatorTestCase extends OperatorTestCase {
         List<Page> results = new ArrayList<>();
         try (
             Driver d = new Driver(
+                "test",
                 driverContext,
                 new CannedSourceOperator(input.iterator()),
                 List.of(simpleWithMode(AggregatorMode.INITIAL).get(driverContext), simpleWithMode(AggregatorMode.FINAL).get(driverContext)),
@@ -86,6 +90,7 @@ public abstract class ForkingOperatorTestCase extends OperatorTestCase {
         List<Page> results = new ArrayList<>();
         try (
             Driver d = new Driver(
+                "test",
                 driverContext,
                 new CannedSourceOperator(partials.iterator()),
                 List.of(simpleWithMode(AggregatorMode.FINAL).get(driverContext)),
@@ -107,6 +112,7 @@ public abstract class ForkingOperatorTestCase extends OperatorTestCase {
 
         try (
             Driver d = new Driver(
+                "test",
                 driverContext,
                 new CannedSourceOperator(input.iterator()),
                 List.of(
@@ -139,6 +145,7 @@ public abstract class ForkingOperatorTestCase extends OperatorTestCase {
         List<Page> results = new ArrayList<>();
         try (
             Driver d = new Driver(
+                "test",
                 driverContext,
                 new CannedSourceOperator(intermediates.iterator()),
                 List.of(simpleWithMode(AggregatorMode.FINAL).get(driverContext)),
@@ -217,6 +224,7 @@ public abstract class ForkingOperatorTestCase extends OperatorTestCase {
         sourceExchanger.addRemoteSink(
             sinkExchanger::fetchPageAsync,
             randomBoolean(),
+            () -> {},
             1,
             ActionListener.<Void>noop().delegateResponse((l, e) -> {
                 throw new AssertionError("unexpected failure", e);
@@ -236,6 +244,7 @@ public abstract class ForkingOperatorTestCase extends OperatorTestCase {
             DriverContext driver1Context = driverContext();
             drivers.add(
                 new Driver(
+                    "test",
                     driver1Context,
                     new CannedSourceOperator(pages.iterator()),
                     List.of(
@@ -245,7 +254,7 @@ public abstract class ForkingOperatorTestCase extends OperatorTestCase {
                         simpleWithMode(AggregatorMode.INTERMEDIATE).get(driver1Context),
                         intermediateOperatorItr.next()
                     ),
-                    new ExchangeSinkOperator(sinkExchanger.createExchangeSink(), Function.identity()),
+                    new ExchangeSinkOperator(sinkExchanger.createExchangeSink(() -> {}), Function.identity()),
                     () -> {}
                 )
             );
@@ -253,6 +262,7 @@ public abstract class ForkingOperatorTestCase extends OperatorTestCase {
         DriverContext driver2Context = driverContext();
         drivers.add(
             new Driver(
+                "test",
                 driver2Context,
                 new ExchangeSourceOperator(sourceExchanger.createExchangeSource()),
                 List.of(

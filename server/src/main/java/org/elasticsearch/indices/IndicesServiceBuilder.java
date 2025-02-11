@@ -20,9 +20,10 @@ import org.elasticsearch.common.settings.Settings;
 import org.elasticsearch.common.util.BigArrays;
 import org.elasticsearch.core.Nullable;
 import org.elasticsearch.env.NodeEnvironment;
-import org.elasticsearch.features.FeatureService;
 import org.elasticsearch.gateway.MetaStateService;
 import org.elasticsearch.index.IndexSettings;
+import org.elasticsearch.index.SlowLogFieldProvider;
+import org.elasticsearch.index.SlowLogFields;
 import org.elasticsearch.index.analysis.AnalysisRegistry;
 import org.elasticsearch.index.engine.EngineFactory;
 import org.elasticsearch.index.mapper.MapperMetrics;
@@ -32,7 +33,7 @@ import org.elasticsearch.indices.breaker.CircuitBreakerService;
 import org.elasticsearch.plugins.EnginePlugin;
 import org.elasticsearch.plugins.IndexStorePlugin;
 import org.elasticsearch.plugins.PluginsService;
-import org.elasticsearch.plugins.SearchPlugin;
+import org.elasticsearch.plugins.internal.InternalSearchPlugin;
 import org.elasticsearch.plugins.internal.rewriter.QueryRewriteInterceptor;
 import org.elasticsearch.script.ScriptService;
 import org.elasticsearch.search.aggregations.support.ValuesSourceRegistry;
@@ -65,7 +66,6 @@ public class IndicesServiceBuilder {
     ScriptService scriptService;
     ClusterService clusterService;
     Client client;
-    FeatureService featureService;
     MetaStateService metaStateService;
     Collection<Function<IndexSettings, Optional<EngineFactory>>> engineFactoryProviders = List.of();
     Map<String, IndexStorePlugin.DirectoryFactory> directoryFactories = Map.of();
@@ -79,6 +79,22 @@ public class IndicesServiceBuilder {
     MapperMetrics mapperMetrics;
     List<SearchOperationListener> searchOperationListener = List.of();
     QueryRewriteInterceptor queryRewriteInterceptor = null;
+    SlowLogFieldProvider slowLogFieldProvider = new SlowLogFieldProvider() {
+        @Override
+        public SlowLogFields create(IndexSettings indexSettings) {
+            return new SlowLogFields() {
+                @Override
+                public Map<String, String> indexFields() {
+                    return Map.of();
+                }
+
+                @Override
+                public Map<String, String> searchFields() {
+                    return Map.of();
+                }
+            };
+        }
+    };
 
     public IndicesServiceBuilder settings(Settings settings) {
         this.settings = settings;
@@ -155,11 +171,6 @@ public class IndicesServiceBuilder {
         return this;
     }
 
-    public IndicesServiceBuilder featureService(FeatureService featureService) {
-        this.featureService = featureService;
-        return this;
-    }
-
     public IndicesServiceBuilder metaStateService(MetaStateService metaStateService) {
         this.metaStateService = metaStateService;
         return this;
@@ -191,6 +202,11 @@ public class IndicesServiceBuilder {
         return this;
     }
 
+    public IndicesServiceBuilder slowLogFieldProvider(SlowLogFieldProvider slowLogFieldProvider) {
+        this.slowLogFieldProvider = slowLogFieldProvider;
+        return this;
+    }
+
     public IndicesService build() {
         Objects.requireNonNull(settings);
         Objects.requireNonNull(pluginsService);
@@ -207,7 +223,6 @@ public class IndicesServiceBuilder {
         Objects.requireNonNull(scriptService);
         Objects.requireNonNull(clusterService);
         Objects.requireNonNull(client);
-        Objects.requireNonNull(featureService);
         Objects.requireNonNull(metaStateService);
         Objects.requireNonNull(engineFactoryProviders);
         Objects.requireNonNull(directoryFactories);
@@ -216,6 +231,7 @@ public class IndicesServiceBuilder {
         Objects.requireNonNull(snapshotCommitSuppliers);
         Objects.requireNonNull(mapperMetrics);
         Objects.requireNonNull(searchOperationListener);
+        Objects.requireNonNull(slowLogFieldProvider);
 
         // collect engine factory providers from plugins
         engineFactoryProviders = pluginsService.filterPlugins(EnginePlugin.class)
@@ -242,8 +258,8 @@ public class IndicesServiceBuilder {
             .flatMap(m -> m.entrySet().stream())
             .collect(Collectors.toMap(Map.Entry::getKey, Map.Entry::getValue));
 
-        var queryRewriteInterceptors = pluginsService.filterPlugins(SearchPlugin.class)
-            .map(SearchPlugin::getQueryRewriteInterceptors)
+        var queryRewriteInterceptors = pluginsService.filterPlugins(InternalSearchPlugin.class)
+            .map(InternalSearchPlugin::getQueryRewriteInterceptors)
             .flatMap(List::stream)
             .collect(Collectors.toMap(QueryRewriteInterceptor::getQueryName, interceptor -> {
                 if (interceptor.getQueryName() == null) {

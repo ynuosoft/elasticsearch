@@ -70,13 +70,11 @@ import static org.elasticsearch.xpack.esql.CsvTestsDataLoader.createInferenceEnd
 import static org.elasticsearch.xpack.esql.CsvTestsDataLoader.deleteInferenceEndpoint;
 import static org.elasticsearch.xpack.esql.CsvTestsDataLoader.loadDataSetIntoEs;
 import static org.elasticsearch.xpack.esql.EsqlTestUtils.classpathResources;
+import static org.elasticsearch.xpack.esql.action.EsqlCapabilities.Cap.SEMANTIC_TEXT_TYPE;
 
 // This test can run very long in serverless configurations
 @TimeoutSuite(millis = 30 * TimeUnits.MINUTE)
 public abstract class EsqlSpecTestCase extends ESRestTestCase {
-
-    // To avoid referencing the main module, we replicate EsqlFeatures.ASYNC_QUERY.id() here
-    protected static final String ASYNC_QUERY_FEATURE_ID = "esql.async_query";
 
     private static final Logger LOGGER = LogManager.getLogger(EsqlSpecTestCase.class);
     private final String fileName;
@@ -131,17 +129,20 @@ public abstract class EsqlSpecTestCase extends ESRestTestCase {
 
     @Before
     public void setup() throws IOException {
+        if (shouldSkipTestsWithSemanticTextFields()) {
+            assumeFalse("semantic_text tests are muted", testCase.requiredCapabilities.contains(SEMANTIC_TEXT_TYPE.capabilityName()));
+        }
         if (supportsInferenceTestService() && clusterHasInferenceEndpoint(client()) == false) {
             createInferenceEndpoint(client());
         }
-
         if (indexExists(availableDatasetsForEs(client(), supportsIndexModeLookup()).iterator().next().indexName()) == false) {
             loadDataSetIntoEs(client(), supportsIndexModeLookup());
         }
     }
 
-    protected boolean supportsAsync() {
-        return clusterHasFeature(ASYNC_QUERY_FEATURE_ID); // the Async API was introduced in 8.13.0
+    // https://github.com/elastic/elasticsearch/issues/121411
+    protected boolean shouldSkipTestsWithSemanticTextFields() {
+        return false;
     }
 
     @AfterClass
@@ -173,11 +174,15 @@ public abstract class EsqlSpecTestCase extends ESRestTestCase {
 
     protected void shouldSkipTest(String testName) throws IOException {
         if (testCase.requiredCapabilities.contains("semantic_text_type")
-            || testCase.requiredCapabilities.contains("semantic_text_aggregations")) {
+            || testCase.requiredCapabilities.contains("semantic_text_aggregations")
+            || testCase.requiredCapabilities.contains("semantic_text_field_caps")) {
             assumeTrue("Inference test service needs to be supported for semantic_text", supportsInferenceTestService());
         }
         checkCapabilities(adminClient(), testFeatureService, testName, testCase);
         assumeTrue("Test " + testName + " is not enabled", isEnabled(testName, instructions, Version.CURRENT));
+        if (shouldSkipTestsWithSemanticTextFields()) {
+            assumeFalse("semantic_text tests are muted", testCase.requiredCapabilities.contains(SEMANTIC_TEXT_TYPE.capabilityName()));
+        }
     }
 
     protected static void checkCapabilities(RestClient client, TestFeatureService testFeatureService, String testName, CsvTestCase testCase)
@@ -199,7 +204,7 @@ public abstract class EsqlSpecTestCase extends ESRestTestCase {
         return hasCapabilities(adminClient(), requiredCapabilities);
     }
 
-    protected static boolean hasCapabilities(RestClient client, List<String> requiredCapabilities) throws IOException {
+    public static boolean hasCapabilities(RestClient client, List<String> requiredCapabilities) throws IOException {
         if (requiredCapabilities.isEmpty()) {
             return true;
         }
@@ -238,7 +243,7 @@ public abstract class EsqlSpecTestCase extends ESRestTestCase {
     protected final void doTest() throws Throwable {
         RequestObjectBuilder builder = new RequestObjectBuilder(randomFrom(XContentType.values()));
 
-        if (testCase.query.toUpperCase(Locale.ROOT).contains("LOOKUP")) {
+        if (testCase.query.toUpperCase(Locale.ROOT).contains("LOOKUP_\uD83D\uDC14")) {
             builder.tables(tables());
         }
 
@@ -280,7 +285,6 @@ public abstract class EsqlSpecTestCase extends ESRestTestCase {
 
     private Map<String, Object> runEsql(RequestObjectBuilder requestObject, AssertWarnings assertWarnings) throws IOException {
         if (mode == Mode.ASYNC) {
-            assert supportsAsync();
             return RestEsqlTestCase.runEsqlAsync(requestObject, assertWarnings);
         } else {
             return RestEsqlTestCase.runEsqlSync(requestObject, assertWarnings);

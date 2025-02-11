@@ -24,8 +24,8 @@ import org.elasticsearch.common.settings.Settings;
 import org.elasticsearch.common.time.DateUtils;
 import org.elasticsearch.common.unit.ByteSizeUnit;
 import org.elasticsearch.common.unit.ByteSizeValue;
+import org.elasticsearch.common.util.FeatureFlag;
 import org.elasticsearch.core.TimeValue;
-import org.elasticsearch.features.NodeFeature;
 import org.elasticsearch.index.mapper.IgnoredSourceFieldMapper;
 import org.elasticsearch.index.mapper.Mapper;
 import org.elasticsearch.index.mapper.SourceFieldMapper;
@@ -40,6 +40,7 @@ import java.util.Iterator;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Objects;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
 
@@ -52,7 +53,6 @@ import static org.elasticsearch.index.mapper.MapperService.INDEX_MAPPING_IGNORE_
 import static org.elasticsearch.index.mapper.MapperService.INDEX_MAPPING_NESTED_DOCS_LIMIT_SETTING;
 import static org.elasticsearch.index.mapper.MapperService.INDEX_MAPPING_NESTED_FIELDS_LIMIT_SETTING;
 import static org.elasticsearch.index.mapper.MapperService.INDEX_MAPPING_TOTAL_FIELDS_LIMIT_SETTING;
-import static org.elasticsearch.index.mapper.SourceFieldMapper.INDEX_MAPPER_SOURCE_MODE_SETTING;
 
 /**
  * This class encapsulates all index level settings and handles settings updates.
@@ -355,7 +355,7 @@ public final class IndexSettings {
          * Prevent the translog from growing over 10GB or 20% of the recommended shard size of 50GB. This helps bound the maximum disk usage
          * overhead of translogs.
          */
-        new ByteSizeValue(10, ByteSizeUnit.GB),
+        ByteSizeValue.of(10, ByteSizeUnit.GB),
         /*
          * An empty translog occupies 55 bytes on disk. If the flush threshold is below this, the flush thread
          * can get stuck in an infinite loop as the shouldPeriodicallyFlush can still be true after flushing.
@@ -387,7 +387,7 @@ public final class IndexSettings {
      */
     public static final Setting<ByteSizeValue> INDEX_FLUSH_AFTER_MERGE_THRESHOLD_SIZE_SETTING = Setting.byteSizeSetting(
         "index.flush_after_merge",
-        new ByteSizeValue(512, ByteSizeUnit.MB),
+        ByteSizeValue.of(512, ByteSizeUnit.MB),
         ByteSizeValue.ZERO, // always flush after merge
         ByteSizeValue.ofBytes(Long.MAX_VALUE), // never flush after merge
         Property.Dynamic,
@@ -400,7 +400,7 @@ public final class IndexSettings {
      */
     public static final Setting<ByteSizeValue> INDEX_TRANSLOG_GENERATION_THRESHOLD_SIZE_SETTING = Setting.byteSizeSetting(
         "index.translog.generation_threshold_size",
-        new ByteSizeValue(64, ByteSizeUnit.MB),
+        ByteSizeValue.of(64, ByteSizeUnit.MB),
         /*
          * An empty translog occupies 55 bytes on disk. If the generation threshold is
          * below this, the flush thread can get stuck in an infinite loop repeatedly
@@ -655,9 +655,102 @@ public final class IndexSettings {
         Property.Final
     );
 
+    /**
+     * Returns <code>true</code> if TSDB encoding is enabled. The default is <code>true</code>
+     */
+    public boolean isES87TSDBCodecEnabled() {
+        return es87TSDBCodecEnabled;
+    }
+
+    public static final Setting<Boolean> LOGSDB_ROUTE_ON_SORT_FIELDS = Setting.boolSetting(
+        "index.logsdb.route_on_sort_fields",
+        false,
+        Property.IndexScope,
+        Property.Final
+    );
+
+    public static final Setting<Boolean> LOGSDB_ADD_HOST_NAME_FIELD = Setting.boolSetting(
+        "index.logsdb.add_host_name_field",
+        false,
+        Property.IndexScope,
+        Property.PrivateIndex,
+        Property.Final
+    );
+
+    public static final Setting<Boolean> LOGSDB_SORT_ON_HOST_NAME = Setting.boolSetting(
+        "index.logsdb.sort_on_host_name",
+        false,
+        Property.IndexScope,
+        Property.PrivateIndex,
+        Property.Final
+    );
+
+    public static final FeatureFlag DOC_VALUES_SKIPPER = new FeatureFlag("doc_values_skipper");
+    public static final Setting<Boolean> USE_DOC_VALUES_SKIPPER = Setting.boolSetting(
+        "index.mapping.use_doc_values_skipper",
+        IndexSettings.DOC_VALUES_SKIPPER.isEnabled(),
+        Property.IndexScope,
+        Property.Final
+    );
+
+    /**
+     * The {@link IndexMode "mode"} of the index.
+     */
+    public static final Setting<IndexMode> MODE = Setting.enumSetting(
+        IndexMode.class,
+        "index.mode",
+        IndexMode.STANDARD,
+        new Setting.Validator<>() {
+            @Override
+            public void validate(IndexMode value) {}
+
+            @Override
+            public void validate(IndexMode value, Map<Setting<?>, Object> settings) {
+                value.validateWithOtherSettings(settings);
+            }
+
+            @Override
+            public Iterator<Setting<?>> settings() {
+                return IndexMode.VALIDATE_WITH_SETTINGS.iterator();
+            }
+        },
+        Property.IndexScope,
+        Property.Final,
+        Property.ServerlessPublic
+    );
+
+    public static final Setting<SourceFieldMapper.Mode> INDEX_MAPPER_SOURCE_MODE_SETTING = Setting.enumSetting(
+        SourceFieldMapper.Mode.class,
+        settings -> {
+            final IndexMode indexMode = IndexSettings.MODE.get(settings);
+            return indexMode.defaultSourceMode().name();
+        },
+        "index.mapping.source.mode",
+        value -> {},
+        Setting.Property.Final,
+        Setting.Property.IndexScope,
+        Setting.Property.ServerlessPublic
+    );
+
+    public static final FeatureFlag RECOVERY_USE_SYNTHETIC_SOURCE = new FeatureFlag("index_recovery_use_synthetic_source");
     public static final Setting<Boolean> RECOVERY_USE_SYNTHETIC_SOURCE_SETTING = Setting.boolSetting(
         "index.recovery.use_synthetic_source",
-        false,
+        settings -> {
+            boolean isSyntheticSourceRecoveryFeatureFlagEnabled = RECOVERY_USE_SYNTHETIC_SOURCE.isEnabled();
+            boolean isNewIndexVersion = SETTING_INDEX_VERSION_CREATED.get(settings)
+                .onOrAfter(IndexVersions.USE_SYNTHETIC_SOURCE_FOR_RECOVERY_BY_DEFAULT);
+            boolean isIndexVersionInBackportRange = SETTING_INDEX_VERSION_CREATED.get(settings)
+                .between(IndexVersions.USE_SYNTHETIC_SOURCE_FOR_RECOVERY_BY_DEFAULT_BACKPORT, IndexVersions.UPGRADE_TO_LUCENE_10_0_0);
+
+            boolean useSyntheticRecoverySource = isSyntheticSourceRecoveryFeatureFlagEnabled
+                && (isNewIndexVersion || isIndexVersionInBackportRange);
+
+            return String.valueOf(
+                useSyntheticRecoverySource
+                    && Objects.equals(INDEX_MAPPER_SOURCE_MODE_SETTING.get(settings), SourceFieldMapper.Mode.SYNTHETIC)
+            );
+
+        },
         new Setting.Validator<>() {
             @Override
             public void validate(Boolean value) {}
@@ -685,67 +778,16 @@ public final class IndexSettings {
                         );
                     }
                 }
-
-                // Verify that all nodes can handle this setting
-                var version = (IndexVersion) settings.get(SETTING_INDEX_VERSION_CREATED);
-                if (version.before(IndexVersions.USE_SYNTHETIC_SOURCE_FOR_RECOVERY)
-                    && version.between(
-                        IndexVersions.USE_SYNTHETIC_SOURCE_FOR_RECOVERY_BACKPORT,
-                        IndexVersions.UPGRADE_TO_LUCENE_10_0_0
-                    ) == false) {
-                    throw new IllegalArgumentException(
-                        String.format(
-                            Locale.ROOT,
-                            "The setting [%s] is unavailable on this cluster because some nodes are running older "
-                                + "versions that do not support it. Please upgrade all nodes to the latest version "
-                                + "and try again.",
-                            RECOVERY_USE_SYNTHETIC_SOURCE_SETTING.getKey()
-                        )
-                    );
-                }
             }
 
             @Override
             public Iterator<Setting<?>> settings() {
-                List<Setting<?>> res = List.of(INDEX_MAPPER_SOURCE_MODE_SETTING, SETTING_INDEX_VERSION_CREATED, MODE);
+                List<Setting<?>> res = List.of(INDEX_MAPPER_SOURCE_MODE_SETTING, MODE);
                 return res.iterator();
             }
         },
         Property.IndexScope,
         Property.Final
-    );
-
-    /**
-     * Returns <code>true</code> if TSDB encoding is enabled. The default is <code>true</code>
-     */
-    public boolean isES87TSDBCodecEnabled() {
-        return es87TSDBCodecEnabled;
-    }
-
-    /**
-     * The {@link IndexMode "mode"} of the index.
-     */
-    public static final Setting<IndexMode> MODE = Setting.enumSetting(
-        IndexMode.class,
-        "index.mode",
-        IndexMode.STANDARD,
-        new Setting.Validator<>() {
-            @Override
-            public void validate(IndexMode value) {}
-
-            @Override
-            public void validate(IndexMode value, Map<Setting<?>, Object> settings) {
-                value.validateWithOtherSettings(settings);
-            }
-
-            @Override
-            public Iterator<Setting<?>> settings() {
-                return IndexMode.VALIDATE_WITH_SETTINGS.iterator();
-            }
-        },
-        Property.IndexScope,
-        Property.Final,
-        Property.ServerlessPublic
     );
 
     /**
@@ -801,8 +843,6 @@ public final class IndexSettings {
         }
     }
 
-    public static final NodeFeature IGNORE_ABOVE_INDEX_LEVEL_SETTING = new NodeFeature("mapper.ignore_above_index_level_setting");
-
     private final Index index;
     private final IndexVersion version;
     private final Logger logger;
@@ -843,6 +883,9 @@ public final class IndexSettings {
     private final boolean softDeleteEnabled;
     private volatile long softDeleteRetentionOperations;
     private final boolean es87TSDBCodecEnabled;
+    private final boolean logsdbRouteOnSortFields;
+    private final boolean logsdbSortOnHostName;
+    private final boolean logsdbAddHostNameField;
 
     private volatile long retentionLeaseMillis;
 
@@ -887,6 +930,7 @@ public final class IndexSettings {
     private final SourceFieldMapper.Mode indexMappingSourceMode;
     private final boolean recoverySourceEnabled;
     private final boolean recoverySourceSyntheticEnabled;
+    private final boolean useDocValuesSkipper;
 
     /**
      * The maximum number of refresh listeners allows on this shard.
@@ -951,6 +995,20 @@ public final class IndexSettings {
      */
     public boolean isDefaultAllowUnmappedFields() {
         return defaultAllowUnmappedFields;
+    }
+
+    /**
+     * Returns <code>true</code> if routing on sort fields is enabled for LogsDB. The default is <code>false</code>
+     */
+    public boolean logsdbRouteOnSortFields() {
+        return logsdbRouteOnSortFields;
+    }
+
+    /**
+     * Returns <code>true</code> if the index is in logsdb mode and needs a [host.name] keyword field. The default is <code>false</code>
+     */
+    public boolean logsdbAddHostNameField() {
+        return logsdbAddHostNameField;
     }
 
     /**
@@ -1045,11 +1103,37 @@ public final class IndexSettings {
         indexRouting = IndexRouting.fromIndexMetadata(indexMetadata);
         sourceKeepMode = scopedSettings.get(Mapper.SYNTHETIC_SOURCE_KEEP_INDEX_SETTING);
         es87TSDBCodecEnabled = scopedSettings.get(TIME_SERIES_ES87TSDB_CODEC_ENABLED_SETTING);
+        logsdbRouteOnSortFields = scopedSettings.get(LOGSDB_ROUTE_ON_SORT_FIELDS);
+        logsdbSortOnHostName = scopedSettings.get(LOGSDB_SORT_ON_HOST_NAME);
+        logsdbAddHostNameField = scopedSettings.get(LOGSDB_ADD_HOST_NAME_FIELD);
         skipIgnoredSourceWrite = scopedSettings.get(IgnoredSourceFieldMapper.SKIP_IGNORED_SOURCE_WRITE_SETTING);
         skipIgnoredSourceRead = scopedSettings.get(IgnoredSourceFieldMapper.SKIP_IGNORED_SOURCE_READ_SETTING);
         indexMappingSourceMode = scopedSettings.get(INDEX_MAPPER_SOURCE_MODE_SETTING);
         recoverySourceEnabled = RecoverySettings.INDICES_RECOVERY_SOURCE_ENABLED_SETTING.get(nodeSettings);
-        recoverySourceSyntheticEnabled = scopedSettings.get(RECOVERY_USE_SYNTHETIC_SOURCE_SETTING);
+        recoverySourceSyntheticEnabled = DiscoveryNode.isStateless(nodeSettings) == false
+            && scopedSettings.get(RECOVERY_USE_SYNTHETIC_SOURCE_SETTING);
+        useDocValuesSkipper = DOC_VALUES_SKIPPER.isEnabled() && scopedSettings.get(USE_DOC_VALUES_SKIPPER);
+        if (recoverySourceSyntheticEnabled) {
+            if (DiscoveryNode.isStateless(settings)) {
+                throw new IllegalArgumentException("synthetic recovery source is only allowed in stateful");
+            }
+            // Verify that all nodes can handle this setting
+            if (version.before(IndexVersions.USE_SYNTHETIC_SOURCE_FOR_RECOVERY)
+                && version.between(
+                    IndexVersions.USE_SYNTHETIC_SOURCE_FOR_RECOVERY_BACKPORT,
+                    IndexVersions.UPGRADE_TO_LUCENE_10_0_0
+                ) == false) {
+                throw new IllegalArgumentException(
+                    String.format(
+                        Locale.ROOT,
+                        "The setting [%s] is unavailable on this cluster because some nodes are running older "
+                            + "versions that do not support it. Please upgrade all nodes to the latest version "
+                            + "and try again.",
+                        RECOVERY_USE_SYNTHETIC_SOURCE_SETTING.getKey()
+                    )
+                );
+            }
+        }
 
         scopedSettings.addSettingsUpdateConsumer(
             MergePolicyConfig.INDEX_COMPOUND_FORMAT_SETTING,
@@ -1377,7 +1461,7 @@ public final class IndexSettings {
         }
         assert onePercentOfTotalDiskSpace > Translog.DEFAULT_HEADER_SIZE_IN_BYTES;
         if (onePercentOfTotalDiskSpace < flushThresholdSize.getBytes()) {
-            return new ByteSizeValue(onePercentOfTotalDiskSpace, ByteSizeUnit.BYTES);
+            return ByteSizeValue.of(onePercentOfTotalDiskSpace, ByteSizeUnit.BYTES);
         } else {
             return flushThresholdSize;
         }
@@ -1746,6 +1830,10 @@ public final class IndexSettings {
      */
     public boolean isRecoverySourceSyntheticEnabled() {
         return recoverySourceSyntheticEnabled;
+    }
+
+    public boolean useDocValuesSkipper() {
+        return useDocValuesSkipper;
     }
 
     /**

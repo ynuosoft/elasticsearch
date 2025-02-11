@@ -11,6 +11,7 @@ package org.elasticsearch.action.search;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
+import org.apache.lucene.util.CollectionUtil;
 import org.elasticsearch.ExceptionsHelper;
 import org.elasticsearch.TransportVersions;
 import org.elasticsearch.action.ActionListener;
@@ -41,7 +42,6 @@ import org.elasticsearch.cluster.metadata.IndexNameExpressionResolver;
 import org.elasticsearch.cluster.metadata.IndexNameExpressionResolver.ResolvedExpression;
 import org.elasticsearch.cluster.node.DiscoveryNode;
 import org.elasticsearch.cluster.node.DiscoveryNodes;
-import org.elasticsearch.cluster.routing.GroupShardsIterator;
 import org.elasticsearch.cluster.routing.OperationRouting;
 import org.elasticsearch.cluster.routing.ShardIterator;
 import org.elasticsearch.cluster.routing.ShardRouting;
@@ -388,10 +388,7 @@ public class TransportSearchAction extends HandledTransportAction<SearchRequest,
                     if (original.pointInTimeBuilder() != null) {
                         tl.setFeature(CCSUsageTelemetry.PIT_FEATURE);
                     }
-                    String client = task.getHeader(Task.X_ELASTIC_PRODUCT_ORIGIN_HTTP_HEADER);
-                    if (client != null) {
-                        tl.setClient(client);
-                    }
+                    tl.setClient(task);
                     // Check if any of the index patterns are wildcard patterns
                     var localIndices = resolvedIndices.getLocalIndices();
                     if (localIndices != null && Arrays.stream(localIndices.indices()).anyMatch(Regex::isSimpleMatchPattern)) {
@@ -508,7 +505,9 @@ public class TransportSearchAction extends HandledTransportAction<SearchRequest,
                 }
             }
         });
+
         final SearchSourceBuilder source = original.source();
+        final boolean isExplain = source != null && source.explain() != null && source.explain();
         if (shouldOpenPIT(source)) {
             // disabling shard reordering for request
             original.setPreFilterShardSize(Integer.MAX_VALUE);
@@ -538,7 +537,12 @@ public class TransportSearchAction extends HandledTransportAction<SearchRequest,
         } else {
             Rewriteable.rewriteAndFetch(
                 original,
-                searchService.getRewriteContext(timeProvider::absoluteStartMillis, resolvedIndices, original.pointInTimeBuilder()),
+                searchService.getRewriteContext(
+                    timeProvider::absoluteStartMillis,
+                    resolvedIndices,
+                    original.pointInTimeBuilder(),
+                    isExplain
+                ),
                 rewriteListener
             );
         }
@@ -1282,7 +1286,7 @@ public class TransportSearchAction extends HandledTransportAction<SearchRequest,
                 );
             }
         }
-        final GroupShardsIterator<SearchShardIterator> shardIterators = mergeShardsIterators(localShardIterators, remoteShardIterators);
+        final List<SearchShardIterator> shardIterators = mergeShardsIterators(localShardIterators, remoteShardIterators);
 
         failIfOverShardCountLimit(clusterService, shardIterators.size());
 
@@ -1416,7 +1420,7 @@ public class TransportSearchAction extends HandledTransportAction<SearchRequest,
     }
 
     // package private for testing
-    static GroupShardsIterator<SearchShardIterator> mergeShardsIterators(
+    static List<SearchShardIterator> mergeShardsIterators(
         List<SearchShardIterator> localShardIterators,
         List<SearchShardIterator> remoteShardIterators
     ) {
@@ -1426,7 +1430,8 @@ public class TransportSearchAction extends HandledTransportAction<SearchRequest,
         } else {
             shards = CollectionUtils.concatLists(remoteShardIterators, localShardIterators);
         }
-        return GroupShardsIterator.sortAndCreate(shards);
+        CollectionUtil.timSort(shards);
+        return shards;
     }
 
     interface SearchPhaseProvider {
@@ -1434,7 +1439,7 @@ public class TransportSearchAction extends HandledTransportAction<SearchRequest,
             SearchTask task,
             SearchRequest searchRequest,
             Executor executor,
-            GroupShardsIterator<SearchShardIterator> shardIterators,
+            List<SearchShardIterator> shardIterators,
             SearchTimeProvider timeProvider,
             BiFunction<String, String, Transport.Connection> connectionLookup,
             ClusterState clusterState,
@@ -1458,7 +1463,7 @@ public class TransportSearchAction extends HandledTransportAction<SearchRequest,
             SearchTask task,
             SearchRequest searchRequest,
             Executor executor,
-            GroupShardsIterator<SearchShardIterator> shardIterators,
+            List<SearchShardIterator> shardIterators,
             SearchTimeProvider timeProvider,
             BiFunction<String, String, Transport.Connection> connectionLookup,
             ClusterState clusterState,
@@ -1851,7 +1856,7 @@ public class TransportSearchAction extends HandledTransportAction<SearchRequest,
         String[] concreteIndices
     ) {
         var routingMap = indexNameExpressionResolver.resolveSearchRouting(clusterState, searchRequest.routing(), searchRequest.indices());
-        GroupShardsIterator<ShardIterator> shardRoutings = clusterService.operationRouting()
+        List<ShardIterator> shardRoutings = clusterService.operationRouting()
             .searchShards(
                 clusterState,
                 concreteIndices,
@@ -1883,7 +1888,7 @@ public class TransportSearchAction extends HandledTransportAction<SearchRequest,
 
         void setFeature(String feature);
 
-        void setClient(String client);
+        void setClient(Task task);
     }
 
     private class SearchResponseActionListener extends DelegatingActionListener<SearchResponse, SearchResponse>
@@ -1917,8 +1922,8 @@ public class TransportSearchAction extends HandledTransportAction<SearchRequest,
         }
 
         @Override
-        public void setClient(String client) {
-            usageBuilder.setClient(client);
+        public void setClient(Task task) {
+            usageBuilder.setClientFromTask(task);
         }
 
         @Override

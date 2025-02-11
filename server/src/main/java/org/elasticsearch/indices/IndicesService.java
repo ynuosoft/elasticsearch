@@ -45,6 +45,7 @@ import org.elasticsearch.cluster.routing.ShardRouting;
 import org.elasticsearch.cluster.service.ClusterService;
 import org.elasticsearch.common.CheckedBiConsumer;
 import org.elasticsearch.common.CheckedSupplier;
+import org.elasticsearch.common.Strings;
 import org.elasticsearch.common.breaker.CircuitBreaker;
 import org.elasticsearch.common.bytes.BytesReference;
 import org.elasticsearch.common.component.AbstractLifecycleComponent;
@@ -78,7 +79,6 @@ import org.elasticsearch.core.TimeValue;
 import org.elasticsearch.env.NodeEnvironment;
 import org.elasticsearch.env.ShardLock;
 import org.elasticsearch.env.ShardLockObtainFailedException;
-import org.elasticsearch.features.FeatureService;
 import org.elasticsearch.gateway.MetaStateService;
 import org.elasticsearch.gateway.MetadataStateFormat;
 import org.elasticsearch.index.CloseUtils;
@@ -96,6 +96,7 @@ import org.elasticsearch.index.engine.CommitStats;
 import org.elasticsearch.index.engine.EngineFactory;
 import org.elasticsearch.index.engine.InternalEngineFactory;
 import org.elasticsearch.index.engine.NoOpEngine;
+import org.elasticsearch.index.engine.ReadOnlyEngine;
 import org.elasticsearch.index.fielddata.IndexFieldDataCache;
 import org.elasticsearch.index.flush.FlushStats;
 import org.elasticsearch.index.get.GetStats;
@@ -125,6 +126,7 @@ import org.elasticsearch.index.shard.IndexingOperationListener;
 import org.elasticsearch.index.shard.IndexingStats;
 import org.elasticsearch.index.shard.SearchOperationListener;
 import org.elasticsearch.index.shard.ShardId;
+import org.elasticsearch.index.translog.TranslogStats;
 import org.elasticsearch.indices.breaker.CircuitBreakerService;
 import org.elasticsearch.indices.cluster.IndicesClusterStateService;
 import org.elasticsearch.indices.fielddata.cache.IndicesFieldDataCache;
@@ -179,11 +181,15 @@ import java.util.function.LongSupplier;
 import java.util.stream.Collectors;
 
 import static java.util.Collections.emptyList;
+import static org.elasticsearch.cluster.metadata.IndexMetadataVerifier.isFullySupportedVersion;
+import static org.elasticsearch.cluster.metadata.IndexMetadataVerifier.isReadOnlySupportedVersion;
 import static org.elasticsearch.common.util.CollectionUtils.arrayAsArrayList;
 import static org.elasticsearch.common.util.concurrent.EsExecutors.daemonThreadFactory;
 import static org.elasticsearch.core.Strings.format;
 import static org.elasticsearch.index.IndexService.IndexCreationContext.CREATE_INDEX;
 import static org.elasticsearch.index.IndexService.IndexCreationContext.METADATA_VERIFICATION;
+import static org.elasticsearch.index.IndexVersions.MINIMUM_COMPATIBLE;
+import static org.elasticsearch.index.IndexVersions.MINIMUM_READONLY_COMPATIBLE;
 import static org.elasticsearch.index.query.AbstractQueryBuilder.parseTopLevelQuery;
 import static org.elasticsearch.search.SearchService.ALLOW_EXPENSIVE_QUERIES;
 
@@ -229,7 +235,6 @@ public class IndicesService extends AbstractLifecycleComponent
     private final ScriptService scriptService;
     private final ClusterService clusterService;
     private final Client client;
-    private final FeatureService featureService;
     private volatile Map<String, IndexService> indices = Map.of();
     private final Map<Index, List<PendingDelete>> pendingDeletes = new HashMap<>();
     private final AtomicInteger numUncompletedDeletes = new AtomicInteger();
@@ -264,6 +269,7 @@ public class IndicesService extends AbstractLifecycleComponent
     private final PostRecoveryMerger postRecoveryMerger;
     private final List<SearchOperationListener> searchOperationListeners;
     private final QueryRewriteInterceptor queryRewriteInterceptor;
+    final SlowLogFieldProvider slowLogFieldProvider; // pkg-private for testingå
 
     @Override
     protected void doStart() {
@@ -301,7 +307,6 @@ public class IndicesService extends AbstractLifecycleComponent
         this.scriptService = builder.scriptService;
         this.clusterService = builder.clusterService;
         this.client = builder.client;
-        this.featureService = builder.featureService;
         this.idFieldDataEnabled = INDICES_ID_FIELD_DATA_ENABLED_SETTING.get(clusterService.getSettings());
         clusterService.getClusterSettings().addSettingsUpdateConsumer(INDICES_ID_FIELD_DATA_ENABLED_SETTING, this::setIdFieldDataEnabled);
         this.indicesFieldDataCache = new IndicesFieldDataCache(settings, new IndexFieldDataCache.Listener() {
@@ -383,6 +388,7 @@ public class IndicesService extends AbstractLifecycleComponent
         this.timestampFieldMapperService = new TimestampFieldMapperService(settings, threadPool, this);
         this.postRecoveryMerger = new PostRecoveryMerger(settings, threadPool.executor(ThreadPool.Names.FORCE_MERGE), this::getShardOrNull);
         this.searchOperationListeners = builder.searchOperationListener;
+        this.slowLogFieldProvider = builder.slowLogFieldProvider;
     }
 
     private static final String DANGLING_INDICES_UPDATE_THREAD_NAME = "DanglingIndices#updateTask";
@@ -753,7 +759,7 @@ public class IndicesService extends AbstractLifecycleComponent
             () -> allowExpensiveQueries,
             indexNameExpressionResolver,
             recoveryStateFactories,
-            loadSlowLogFieldProvider(),
+            slowLogFieldProvider,
             mapperMetrics,
             searchOperationListeners
         );
@@ -799,6 +805,22 @@ public class IndicesService extends AbstractLifecycleComponent
             .filter(maybe -> Objects.requireNonNull(maybe).isPresent())
             .toList();
         if (engineFactories.isEmpty()) {
+            if (indexMetadata == null || isFullySupportedVersion(indexMetadata, MINIMUM_COMPATIBLE)) {
+                return new InternalEngineFactory();
+            } else if (isReadOnlySupportedVersion(indexMetadata, MINIMUM_COMPATIBLE, MINIMUM_READONLY_COMPATIBLE)) {
+                return config -> {
+                    return new ReadOnlyEngine(
+                        config,
+                        null,
+                        config.getTranslogConfig().hasTranslog() ? null : new TranslogStats(0, 0, 0, 0, 0),
+                        true,
+                        Function.identity(),
+                        true,
+                        true
+                    );
+                };
+            }
+            assert false : "unsupported: " + Strings.toString(indexMetadata);
             return new InternalEngineFactory();
         } else if (engineFactories.size() == 1) {
             assert engineFactories.get(0).isPresent();
@@ -833,7 +855,7 @@ public class IndicesService extends AbstractLifecycleComponent
             () -> allowExpensiveQueries,
             indexNameExpressionResolver,
             recoveryStateFactories,
-            loadSlowLogFieldProvider(),
+            slowLogFieldProvider,
             mapperMetrics,
             searchOperationListeners
         );
@@ -1439,31 +1461,6 @@ public class IndicesService extends AbstractLifecycleComponent
         }
     }
 
-    // pkg-private for testing
-    SlowLogFieldProvider loadSlowLogFieldProvider() {
-        List<? extends SlowLogFieldProvider> slowLogFieldProviders = pluginsService.loadServiceProviders(SlowLogFieldProvider.class);
-        return new SlowLogFieldProvider() {
-            @Override
-            public void init(IndexSettings indexSettings) {
-                slowLogFieldProviders.forEach(provider -> provider.init(indexSettings));
-            }
-
-            @Override
-            public Map<String, String> indexSlowLogFields() {
-                return slowLogFieldProviders.stream()
-                    .flatMap(provider -> provider.indexSlowLogFields().entrySet().stream())
-                    .collect(Collectors.toMap(Map.Entry::getKey, Map.Entry::getValue));
-            }
-
-            @Override
-            public Map<String, String> searchSlowLogFields() {
-                return slowLogFieldProviders.stream()
-                    .flatMap(provider -> provider.searchSlowLogFields().entrySet().stream())
-                    .collect(Collectors.toMap(Map.Entry::getKey, Map.Entry::getValue));
-            }
-        };
-    }
-
     /**
      * Checks if all pending deletes have completed. Used by tests to ensure we don't check directory contents
      * while deletion still ongoing. * The reason is that, on Windows, browsing the directory contents can interfere
@@ -1770,7 +1767,19 @@ public class IndicesService extends AbstractLifecycleComponent
      * Returns a new {@link QueryRewriteContext} with the given {@code now} provider
      */
     public QueryRewriteContext getRewriteContext(LongSupplier nowInMillis, ResolvedIndices resolvedIndices, PointInTimeBuilder pit) {
-        return new QueryRewriteContext(parserConfig, client, nowInMillis, resolvedIndices, pit, queryRewriteInterceptor);
+        return getRewriteContext(nowInMillis, resolvedIndices, pit, false);
+    }
+
+    /**
+     * Returns a new {@link QueryRewriteContext} with the given {@code now} provider
+     */
+    public QueryRewriteContext getRewriteContext(
+        LongSupplier nowInMillis,
+        ResolvedIndices resolvedIndices,
+        PointInTimeBuilder pit,
+        final boolean isExplain
+    ) {
+        return new QueryRewriteContext(parserConfig, client, nowInMillis, resolvedIndices, pit, queryRewriteInterceptor, isExplain);
     }
 
     public DataRewriteContext getDataRewriteContext(LongSupplier nowInMillis) {
