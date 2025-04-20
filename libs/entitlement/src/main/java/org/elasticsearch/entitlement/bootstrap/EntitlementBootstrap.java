@@ -14,6 +14,7 @@ import com.sun.tools.attach.AgentLoadException;
 import com.sun.tools.attach.AttachNotSupportedException;
 import com.sun.tools.attach.VirtualMachine;
 
+import org.elasticsearch.core.Nullable;
 import org.elasticsearch.core.SuppressForbidden;
 import org.elasticsearch.entitlement.initialization.EntitlementInitialization;
 import org.elasticsearch.entitlement.runtime.policy.Policy;
@@ -33,6 +34,7 @@ import static java.util.Objects.requireNonNull;
 public class EntitlementBootstrap {
 
     public record BootstrapArgs(
+        @Nullable Policy serverPolicyPatch,
         Map<String, Policy> pluginPolicies,
         Function<Class<?>, String> pluginResolver,
         Function<String, Stream<String>> settingResolver,
@@ -40,6 +42,7 @@ public class EntitlementBootstrap {
         Path[] sharedRepoDirs,
         Path configDir,
         Path libDir,
+        Path modulesDir,
         Path pluginsDir,
         Map<String, Path> sourcePaths,
         Path logsDir,
@@ -58,6 +61,7 @@ public class EntitlementBootstrap {
             requireNonNull(sharedRepoDirs);
             requireNonNull(configDir);
             requireNonNull(libDir);
+            requireNonNull(modulesDir);
             requireNonNull(pluginsDir);
             requireNonNull(sourcePaths);
             requireNonNull(logsDir);
@@ -76,6 +80,7 @@ public class EntitlementBootstrap {
      * Activates entitlement checking. Once this method returns, calls to methods protected by Entitlements from classes without a valid
      * policy will throw {@link org.elasticsearch.entitlement.runtime.api.NotEntitledException}.
      *
+     * @param serverPolicyPatch a policy with additional entitlements to patch the embedded server layer policy
      * @param pluginPolicies a map holding policies for plugins (and modules), by plugin (or module) name.
      * @param pluginResolver a functor to map a Java Class to the plugin it belongs to (the plugin name).
      * @param settingResolver a functor to resolve a setting name pattern for one or more Elasticsearch settings.
@@ -83,6 +88,7 @@ public class EntitlementBootstrap {
      * @param sharedRepoDirs shared repository directories for Elasticsearch
      * @param configDir      the config directory for Elasticsearch
      * @param libDir         the lib directory for Elasticsearch
+     * @param modulesDir     the directory where Elasticsearch modules are
      * @param pluginsDir     the directory where plugins are installed for Elasticsearch
      * @param sourcePaths    a map holding the path to each plugin or module jars, by plugin (or module) name.
      * @param tempDir        the temp directory for Elasticsearch
@@ -91,6 +97,7 @@ public class EntitlementBootstrap {
      * @param suppressFailureLogClasses   classes for which we do not need or want to log Entitlements failures
      */
     public static void bootstrap(
+        Policy serverPolicyPatch,
         Map<String, Policy> pluginPolicies,
         Function<Class<?>, String> pluginResolver,
         Function<String, Stream<String>> settingResolver,
@@ -98,6 +105,7 @@ public class EntitlementBootstrap {
         Path[] sharedRepoDirs,
         Path configDir,
         Path libDir,
+        Path modulesDir,
         Path pluginsDir,
         Map<String, Path> sourcePaths,
         Path logsDir,
@@ -110,6 +118,7 @@ public class EntitlementBootstrap {
             throw new IllegalStateException("plugin data is already set");
         }
         EntitlementBootstrap.bootstrapArgs = new BootstrapArgs(
+            serverPolicyPatch,
             pluginPolicies,
             pluginResolver,
             settingResolver,
@@ -117,6 +126,7 @@ public class EntitlementBootstrap {
             sharedRepoDirs,
             configDir,
             libDir,
+            modulesDir,
             pluginsDir,
             sourcePaths,
             logsDir,
@@ -156,7 +166,8 @@ public class EntitlementBootstrap {
             return propertyValue;
         }
 
-        Path dir = Path.of("lib", "entitlement-agent");
+        Path esHome = Path.of(System.getProperty("es.path.home"));
+        Path dir = esHome.resolve("lib/entitlement-agent");
         if (Files.exists(dir) == false) {
             throw new IllegalStateException("Directory for entitlement jar does not exist: " + dir);
         }

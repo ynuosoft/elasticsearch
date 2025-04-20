@@ -16,7 +16,7 @@ import org.elasticsearch.action.OriginalIndices;
 import org.elasticsearch.action.support.ChannelActionListener;
 import org.elasticsearch.action.support.RefCountingRunnable;
 import org.elasticsearch.cluster.node.DiscoveryNode;
-import org.elasticsearch.compute.operator.DriverProfile;
+import org.elasticsearch.compute.operator.DriverCompletionInfo;
 import org.elasticsearch.compute.operator.exchange.ExchangeService;
 import org.elasticsearch.compute.operator.exchange.ExchangeSink;
 import org.elasticsearch.compute.operator.exchange.ExchangeSinkHandler;
@@ -42,6 +42,7 @@ import org.elasticsearch.transport.TransportService;
 import org.elasticsearch.xpack.esql.core.expression.FoldContext;
 import org.elasticsearch.xpack.esql.plan.physical.ExchangeSinkExec;
 import org.elasticsearch.xpack.esql.plan.physical.PhysicalPlan;
+import org.elasticsearch.xpack.esql.planner.PlanConcurrencyCalculator;
 import org.elasticsearch.xpack.esql.planner.PlannerUtils;
 import org.elasticsearch.xpack.esql.session.Configuration;
 
@@ -98,8 +99,16 @@ final class DataNodeComputeHandler implements TransportRequestHandler<DataNodeRe
         Runnable runOnTaskFailure,
         ActionListener<ComputeResponse> outListener
     ) {
-        final boolean allowPartialResults = configuration.allowPartialResults();
-        DataNodeRequestSender sender = new DataNodeRequestSender(transportService, esqlExecutor, parentTask, allowPartialResults) {
+        Integer maxConcurrentNodesPerCluster = PlanConcurrencyCalculator.INSTANCE.calculateNodesConcurrency(dataNodePlan, configuration);
+
+        new DataNodeRequestSender(
+            transportService,
+            esqlExecutor,
+            clusterAlias,
+            parentTask,
+            configuration.allowPartialResults(),
+            maxConcurrentNodesPerCluster == null ? -1 : maxConcurrentNodesPerCluster
+        ) {
             @Override
             protected void sendRequest(
                 DiscoveryNode node,
@@ -107,6 +116,11 @@ final class DataNodeComputeHandler implements TransportRequestHandler<DataNodeRe
                 Map<Index, AliasFilter> aliasFilters,
                 NodeListener nodeListener
             ) {
+                if (exchangeSource.isFinished()) {
+                    nodeListener.onSkip();
+                    return;
+                }
+
                 final AtomicLong pagesFetched = new AtomicLong();
                 var listener = ActionListener.wrap(nodeListener::onResponse, e -> nodeListener.onFailure(e, pagesFetched.get() > 0));
                 final Transport.Connection connection;
@@ -129,7 +143,7 @@ final class DataNodeComputeHandler implements TransportRequestHandler<DataNodeRe
                     listener.delegateFailureAndWrap((l, unused) -> {
                         final Runnable onGroupFailure;
                         final CancellableTask groupTask;
-                        if (allowPartialResults) {
+                        if (configuration.allowPartialResults()) {
                             try {
                                 groupTask = computeService.createGroupTask(
                                     parentTask,
@@ -152,7 +166,7 @@ final class DataNodeComputeHandler implements TransportRequestHandler<DataNodeRe
                             final var remoteSink = exchangeService.newRemoteSink(groupTask, childSessionId, transportService, connection);
                             exchangeSource.addRemoteSink(
                                 remoteSink,
-                                allowPartialResults == false,
+                                configuration.allowPartialResults() == false,
                                 pagesFetched::incrementAndGet,
                                 queryPragmas.concurrentExchangeClients(),
                                 computeListener.acquireAvoid()
@@ -177,16 +191,14 @@ final class DataNodeComputeHandler implements TransportRequestHandler<DataNodeRe
                                 TransportRequestOptions.EMPTY,
                                 new ActionListenerResponseHandler<>(computeListener.acquireCompute().map(r -> {
                                     nodeResponseRef.set(r);
-                                    return r.profiles();
+                                    return r.completionInfo();
                                 }), DataNodeComputeResponse::new, esqlExecutor)
                             );
                         }
                     })
                 );
             }
-        };
-        sender.startComputeOnDataNodes(
-            clusterAlias,
+        }.startComputeOnDataNodes(
             concreteIndices,
             originalIndices,
             PlannerUtils.canMatchFilter(dataNodePlan),
@@ -238,15 +250,15 @@ final class DataNodeComputeHandler implements TransportRequestHandler<DataNodeRe
             final int endBatchIndex = Math.min(startBatchIndex + maxConcurrentShards, request.shardIds().size());
             final AtomicInteger pagesProduced = new AtomicInteger();
             List<ShardId> shardIds = request.shardIds().subList(startBatchIndex, endBatchIndex);
-            ActionListener<List<DriverProfile>> batchListener = new ActionListener<>() {
-                final ActionListener<List<DriverProfile>> ref = computeListener.acquireCompute();
+            ActionListener<DriverCompletionInfo> batchListener = new ActionListener<>() {
+                final ActionListener<DriverCompletionInfo> ref = computeListener.acquireCompute();
 
                 @Override
-                public void onResponse(List<DriverProfile> result) {
+                public void onResponse(DriverCompletionInfo info) {
                     try {
                         onBatchCompleted(endBatchIndex);
                     } finally {
-                        ref.onResponse(result);
+                        ref.onResponse(info);
                     }
                 }
 
@@ -256,7 +268,7 @@ final class DataNodeComputeHandler implements TransportRequestHandler<DataNodeRe
                         for (ShardId shardId : shardIds) {
                             addShardLevelFailure(shardId, e);
                         }
-                        onResponse(List.of());
+                        onResponse(DriverCompletionInfo.EMPTY);
                     } else {
                         // TODO: add these to fatal failures so we can continue processing other shards.
                         try {
@@ -270,7 +282,7 @@ final class DataNodeComputeHandler implements TransportRequestHandler<DataNodeRe
             acquireSearchContexts(clusterAlias, shardIds, configuration, request.aliasFilters(), ActionListener.wrap(searchContexts -> {
                 assert ThreadPool.assertCurrentThreadPool(ThreadPool.Names.SEARCH, ESQL_WORKER_THREAD_POOL_NAME);
                 if (searchContexts.isEmpty()) {
-                    batchListener.onResponse(List.of());
+                    batchListener.onResponse(DriverCompletionInfo.EMPTY);
                     return;
                 }
                 var computeContext = new ComputeContext(

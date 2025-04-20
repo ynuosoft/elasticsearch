@@ -23,8 +23,12 @@ import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 import java.util.function.BiConsumer;
 
 import static java.util.Comparator.comparing;
@@ -42,27 +46,47 @@ public final class FileAccessTree {
     /**
      * An intermediary structure to help globally validate exclusive paths, and then build exclusive paths for individual modules.
      */
-    record ExclusivePath(String componentName, String moduleName, String path) {
+    record ExclusivePath(String componentName, Set<String> moduleNames, String path) {
 
         @Override
         public String toString() {
-            return "[[" + componentName + "] [" + moduleName + "] [" + path + "]]";
+            return "[[" + componentName + "] " + moduleNames + " [" + path + "]]";
         }
     }
 
     static List<ExclusivePath> buildExclusivePathList(List<ExclusiveFileEntitlement> exclusiveFileEntitlements, PathLookup pathLookup) {
-        List<ExclusivePath> exclusivePaths = new ArrayList<>();
+        Map<String, ExclusivePath> exclusivePaths = new HashMap<>();
         for (ExclusiveFileEntitlement efe : exclusiveFileEntitlements) {
             for (FilesEntitlement.FileData fd : efe.filesEntitlement().filesData()) {
                 if (fd.exclusive()) {
                     List<Path> paths = fd.resolvePaths(pathLookup).toList();
                     for (Path path : paths) {
-                        exclusivePaths.add(new ExclusivePath(efe.componentName(), efe.moduleName(), normalizePath(path)));
+                        String normalizedPath = normalizePath(path);
+                        var exclusivePath = exclusivePaths.computeIfAbsent(
+                            normalizedPath,
+                            k -> new ExclusivePath(efe.componentName(), new HashSet<>(), normalizedPath)
+                        );
+                        if (exclusivePath.componentName().equals(efe.componentName()) == false) {
+                            throw new IllegalArgumentException(
+                                "Path ["
+                                    + normalizedPath
+                                    + "] is already exclusive to ["
+                                    + exclusivePath.componentName()
+                                    + "]"
+                                    + exclusivePath.moduleNames
+                                    + ", cannot add exclusive access for ["
+                                    + efe.componentName()
+                                    + "]["
+                                    + efe.moduleName
+                                    + "]"
+                            );
+                        }
+                        exclusivePath.moduleNames.add(efe.moduleName());
                     }
                 }
             }
         }
-        return exclusivePaths.stream().sorted(comparing(ExclusivePath::path, PATH_ORDER)).distinct().toList();
+        return exclusivePaths.values().stream().sorted(comparing(ExclusivePath::path, PATH_ORDER)).distinct().toList();
     }
 
     static void validateExclusivePaths(List<ExclusivePath> exclusivePaths) {
@@ -87,21 +111,22 @@ public final class FileAccessTree {
     private final String[] readPaths;
     private final String[] writePaths;
 
-    private FileAccessTree(
+    private static String[] buildUpdatedAndSortedExclusivePaths(
         String componentName,
         String moduleName,
-        FilesEntitlement filesEntitlement,
-        PathLookup pathLookup,
-        Path componentPath,
         List<ExclusivePath> exclusivePaths
     ) {
         List<String> updatedExclusivePaths = new ArrayList<>();
         for (ExclusivePath exclusivePath : exclusivePaths) {
-            if (exclusivePath.componentName().equals(componentName) == false || exclusivePath.moduleName().equals(moduleName) == false) {
+            if (exclusivePath.componentName().equals(componentName) == false || exclusivePath.moduleNames().contains(moduleName) == false) {
                 updatedExclusivePaths.add(exclusivePath.path());
             }
         }
+        updatedExclusivePaths.sort(PATH_ORDER);
+        return updatedExclusivePaths.toArray(new String[0]);
+    }
 
+    private FileAccessTree(FilesEntitlement filesEntitlement, PathLookup pathLookup, Path componentPath, String[] sortedExclusivePaths) {
         List<String> readPaths = new ArrayList<>();
         List<String> writePaths = new ArrayList<>();
         BiConsumer<Path, Mode> addPath = (path, mode) -> {
@@ -153,11 +178,10 @@ public final class FileAccessTree {
         Path jdk = Paths.get(System.getProperty("java.home"));
         addPathAndMaybeLink.accept(jdk.resolve("conf"), Mode.READ);
 
-        updatedExclusivePaths.sort(PATH_ORDER);
         readPaths.sort(PATH_ORDER);
         writePaths.sort(PATH_ORDER);
 
-        this.exclusivePaths = updatedExclusivePaths.toArray(new String[0]);
+        this.exclusivePaths = sortedExclusivePaths;
         this.readPaths = pruneSortedPaths(readPaths).toArray(new String[0]);
         this.writePaths = pruneSortedPaths(writePaths).toArray(new String[0]);
     }
@@ -179,7 +203,7 @@ public final class FileAccessTree {
         return prunedReadPaths;
     }
 
-    public static FileAccessTree of(
+    static FileAccessTree of(
         String componentName,
         String moduleName,
         FilesEntitlement filesEntitlement,
@@ -187,14 +211,30 @@ public final class FileAccessTree {
         @Nullable Path componentPath,
         List<ExclusivePath> exclusivePaths
     ) {
-        return new FileAccessTree(componentName, moduleName, filesEntitlement, pathLookup, componentPath, exclusivePaths);
+        return new FileAccessTree(
+            filesEntitlement,
+            pathLookup,
+            componentPath,
+            buildUpdatedAndSortedExclusivePaths(componentName, moduleName, exclusivePaths)
+        );
     }
 
-    boolean canRead(Path path) {
+    /**
+     * A special factory method to create a FileAccessTree with no ExclusivePaths, e.g. for quick validation or for default file access
+     */
+    public static FileAccessTree withoutExclusivePaths(
+        FilesEntitlement filesEntitlement,
+        PathLookup pathLookup,
+        @Nullable Path componentPath
+    ) {
+        return new FileAccessTree(filesEntitlement, pathLookup, componentPath, new String[0]);
+    }
+
+    public boolean canRead(Path path) {
         return checkPath(normalizePath(path), readPaths);
     }
 
-    boolean canWrite(Path path) {
+    public boolean canWrite(Path path) {
         return checkPath(normalizePath(path), writePaths);
     }
 
