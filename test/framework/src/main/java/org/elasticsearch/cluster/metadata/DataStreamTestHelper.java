@@ -17,6 +17,7 @@ import org.elasticsearch.cluster.routing.allocation.AllocationService;
 import org.elasticsearch.cluster.routing.allocation.WriteLoadForecaster;
 import org.elasticsearch.cluster.service.ClusterService;
 import org.elasticsearch.common.UUIDs;
+import org.elasticsearch.common.compress.CompressedXContent;
 import org.elasticsearch.common.settings.IndexScopedSettings;
 import org.elasticsearch.common.settings.Settings;
 import org.elasticsearch.core.CheckedFunction;
@@ -58,6 +59,7 @@ import org.hamcrest.Description;
 import org.hamcrest.Matcher;
 import org.hamcrest.TypeSafeMatcher;
 
+import java.io.IOException;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -85,6 +87,7 @@ import static org.elasticsearch.test.ESTestCase.randomIntBetween;
 import static org.elasticsearch.test.ESTestCase.randomMap;
 import static org.elasticsearch.test.ESTestCase.randomMillisUpToYear9999;
 import static org.elasticsearch.test.ESTestCase.randomPositiveTimeValue;
+import static org.junit.Assert.fail;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
@@ -335,6 +338,11 @@ public final class DataStreamTestHelper {
     }
 
     public static DataStream randomInstance(String dataStreamName, LongSupplier timeProvider, boolean failureStore) {
+        // Some tests don't work well with system data streams, since these data streams require special handling
+        return randomInstance(dataStreamName, timeProvider, failureStore, false);
+    }
+
+    public static DataStream randomInstance(String dataStreamName, LongSupplier timeProvider, boolean failureStore, boolean system) {
         List<Index> indices = randomIndexInstances();
         long generation = indices.size() + ESTestCase.randomLongBetween(1, 128);
         indices.add(new Index(getDefaultBackingIndexName(dataStreamName, generation), UUIDs.randomBase64UUID(LuceneTestCase.random())));
@@ -360,9 +368,10 @@ public final class DataStreamTestHelper {
             generation,
             metadata,
             randomSettings(),
-            randomBoolean(),
+            randomMappings(),
+            system ? true : randomBoolean(),
             replicated,
-            false, // Some tests don't work well with system data streams, since these data streams require special handling
+            system,
             timeProvider,
             randomBoolean(),
             randomBoolean() ? IndexMode.STANDARD : null, // IndexMode.TIME_SERIES triggers validation that many unit tests doesn't pass
@@ -393,6 +402,15 @@ public final class DataStreamTestHelper {
                 )
                 .build()
         );
+    }
+
+    private static CompressedXContent randomMappings() {
+        try {
+            return new CompressedXContent("{\"properties\":{\"" + randomAlphaOfLength(5) + "\":{\"type\":\"keyword\"}}}");
+        } catch (IOException e) {
+            fail("got an IO exception creating fake mappings: " + e);
+            return null;
+        }
     }
 
     public static DataStreamAlias randomAliasInstance() {

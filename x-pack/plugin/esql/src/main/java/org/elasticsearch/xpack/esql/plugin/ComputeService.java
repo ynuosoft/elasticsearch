@@ -19,7 +19,6 @@ import org.elasticsearch.common.util.concurrent.RunOnce;
 import org.elasticsearch.compute.data.BlockFactory;
 import org.elasticsearch.compute.data.Page;
 import org.elasticsearch.compute.lucene.DataPartitioning;
-import org.elasticsearch.compute.operator.Driver;
 import org.elasticsearch.compute.operator.DriverCompletionInfo;
 import org.elasticsearch.compute.operator.DriverTaskRunner;
 import org.elasticsearch.compute.operator.FailureCollector;
@@ -27,6 +26,7 @@ import org.elasticsearch.compute.operator.exchange.ExchangeService;
 import org.elasticsearch.compute.operator.exchange.ExchangeSink;
 import org.elasticsearch.compute.operator.exchange.ExchangeSinkHandler;
 import org.elasticsearch.compute.operator.exchange.ExchangeSourceHandler;
+import org.elasticsearch.core.RefCounted;
 import org.elasticsearch.core.Releasable;
 import org.elasticsearch.core.Releasables;
 import org.elasticsearch.core.Tuple;
@@ -194,8 +194,8 @@ public class ComputeService {
         List<PhysicalPlan> subplans = subplansAndMainPlan.v1();
 
         // we have no sub plans, so we can just execute the given plan
-        if (subplans == null || subplans.size() == 0) {
-            executePlan(sessionId, rootTask, physicalPlan, configuration, foldContext, execInfo, listener, null);
+        if (subplans == null || subplans.isEmpty()) {
+            executePlan(sessionId, rootTask, physicalPlan, configuration, foldContext, execInfo, null, listener, null);
             return;
         }
 
@@ -220,7 +220,7 @@ public class ComputeService {
             var finalListener = ActionListener.runBefore(listener, () -> exchangeService.removeExchangeSourceHandler(sessionId));
             var computeContext = new ComputeContext(
                 mainSessionId,
-                "single",
+                "main.final",
                 LOCAL_CLUSTER,
                 List.of(),
                 configuration,
@@ -230,7 +230,6 @@ public class ComputeService {
             );
 
             Runnable cancelQueryOnFailure = cancelQueryOnFailure(rootTask);
-            PhysicalPlan finalMainPlan = mainPlan;
 
             try (
                 ComputeListener localListener = new ComputeListener(
@@ -238,28 +237,39 @@ public class ComputeService {
                     cancelQueryOnFailure,
                     finalListener.map(profiles -> {
                         execInfo.markEndQuery();
-                        return new Result(finalMainPlan.output(), collectedPages, profiles, execInfo);
+                        return new Result(mainPlan.output(), collectedPages, profiles, execInfo);
                     })
                 )
             ) {
-                runCompute(rootTask, computeContext, finalMainPlan, localListener.acquireCompute());
+                runCompute(rootTask, computeContext, mainPlan, localListener.acquireCompute());
 
-                for (PhysicalPlan subplan : subplans) {
+                for (int i = 0; i < subplans.size(); i++) {
+                    var subplan = subplans.get(i);
                     var childSessionId = newChildSession(sessionId);
                     ExchangeSinkHandler exchangeSink = exchangeService.createSinkHandler(childSessionId, queryPragmas.exchangeBufferSize());
                     // funnel sub plan pages into the main plan exchange source
                     mainExchangeSource.addRemoteSink(exchangeSink::fetchPageAsync, true, () -> {}, 1, ActionListener.noop());
                     var subPlanListener = localListener.acquireCompute();
 
-                    executePlan(childSessionId, rootTask, subplan, configuration, foldContext, execInfo, ActionListener.wrap(result -> {
-                        exchangeSink.addCompletionListener(
-                            ActionListener.running(() -> { exchangeService.finishSinkHandler(childSessionId, null); })
-                        );
-                        subPlanListener.onResponse(result.completionInfo());
-                    }, e -> {
-                        exchangeService.finishSinkHandler(childSessionId, e);
-                        subPlanListener.onFailure(e);
-                    }), () -> exchangeSink.createExchangeSink(() -> {}));
+                    executePlan(
+                        childSessionId,
+                        rootTask,
+                        subplan,
+                        configuration,
+                        foldContext,
+                        execInfo,
+                        "subplan-" + i,
+                        ActionListener.wrap(result -> {
+                            exchangeSink.addCompletionListener(
+                                ActionListener.running(() -> { exchangeService.finishSinkHandler(childSessionId, null); })
+                            );
+                            subPlanListener.onResponse(result.completionInfo());
+                        }, e -> {
+                            exchangeService.finishSinkHandler(childSessionId, e);
+                            subPlanListener.onFailure(e);
+                        }),
+                        () -> exchangeSink.createExchangeSink(() -> {})
+                    );
                 }
             }
         }
@@ -272,6 +282,7 @@ public class ComputeService {
         Configuration configuration,
         FoldContext foldContext,
         EsqlExecutionInfo execInfo,
+        String profileQualifier,
         ActionListener<Result> listener,
         Supplier<ExchangeSink> exchangeSinkSupplier
     ) {
@@ -309,7 +320,7 @@ public class ComputeService {
             }
             var computeContext = new ComputeContext(
                 newChildSession(sessionId),
-                "single",
+                profileDescription(profileQualifier, "single"),
                 LOCAL_CLUSTER,
                 List.of(),
                 configuration,
@@ -395,7 +406,7 @@ public class ComputeService {
                         rootTask,
                         new ComputeContext(
                             sessionId,
-                            "final",
+                            profileDescription(profileQualifier, "final"),
                             LOCAL_CLUSTER,
                             List.of(),
                             configuration,
@@ -527,13 +538,16 @@ public class ComputeService {
 
                 @Override
                 public SourceProvider createSourceProvider() {
-                    final Supplier<SourceProvider> supplier = () -> super.createSourceProvider();
-                    return new ReinitializingSourceProvider(supplier);
-
+                    return new ReinitializingSourceProvider(super::createSourceProvider);
                 }
             };
             contexts.add(
-                new EsPhysicalOperationProviders.DefaultShardContext(i, searchExecutionContext, searchContext.request().getAliasFilter())
+                new EsPhysicalOperationProviders.DefaultShardContext(
+                    i,
+                    searchContext,
+                    searchExecutionContext,
+                    searchContext.request().getAliasFilter()
+                )
             );
         }
         EsPhysicalOperationProviders physicalOperationProviders = new EsPhysicalOperationProviders(
@@ -542,7 +556,6 @@ public class ComputeService {
             searchService.getIndicesService().getAnalysis(),
             defaultDataPartitioning
         );
-        final List<Driver> drivers;
         try {
             LocalExecutionPlanner planner = new LocalExecutionPlanner(
                 context.sessionId(),
@@ -563,37 +576,43 @@ public class ComputeService {
 
             LOGGER.debug("Received physical plan:\n{}", plan);
 
-            plan = PlannerUtils.localPlan(context.searchExecutionContexts(), context.configuration(), context.foldCtx(), plan);
+            var localPlan = PlannerUtils.localPlan(context.searchExecutionContexts(), context.configuration(), context.foldCtx(), plan);
             // the planner will also set the driver parallelism in LocalExecutionPlanner.LocalExecutionPlan (used down below)
             // it's doing this in the planning of EsQueryExec (the source of the data)
             // see also EsPhysicalOperationProviders.sourcePhysicalOperation
-            LocalExecutionPlanner.LocalExecutionPlan localExecutionPlan = planner.plan(context.description(), context.foldCtx(), plan);
+            LocalExecutionPlanner.LocalExecutionPlan localExecutionPlan = planner.plan(context.description(), context.foldCtx(), localPlan);
             if (LOGGER.isDebugEnabled()) {
                 LOGGER.debug("Local execution plan:\n{}", localExecutionPlan.describe());
             }
-            drivers = localExecutionPlan.createDrivers(context.sessionId());
+            var drivers = localExecutionPlan.createDrivers(context.sessionId());
+            // After creating the drivers (and therefore, the operators), we can safely decrement the reference count since the operators
+            // will hold a reference to the contexts where relevant.
+            contexts.forEach(RefCounted::decRef);
             if (drivers.isEmpty()) {
                 throw new IllegalStateException("no drivers created");
             }
             LOGGER.debug("using {} drivers", drivers.size());
+            driverRunner.executeDrivers(
+                task,
+                drivers,
+                transportService.getThreadPool().executor(ESQL_WORKER_THREAD_POOL_NAME),
+                ActionListener.releaseAfter(listener.map(ignored -> {
+                    if (context.configuration().profile()) {
+                        return DriverCompletionInfo.includingProfiles(
+                            drivers,
+                            context.description(),
+                            clusterService.getClusterName().value(),
+                            transportService.getLocalNode().getName(),
+                            localPlan.toString()
+                        );
+                    } else {
+                        return DriverCompletionInfo.excludingProfiles(drivers);
+                    }
+                }), () -> Releasables.close(drivers))
+            );
         } catch (Exception e) {
             listener.onFailure(e);
-            return;
         }
-        ActionListener<Void> listenerCollectingStatus = listener.map(ignored -> {
-            if (context.configuration().profile()) {
-                return DriverCompletionInfo.includingProfiles(drivers);
-            } else {
-                return DriverCompletionInfo.excludingProfiles(drivers);
-            }
-        });
-        listenerCollectingStatus = ActionListener.releaseAfter(listenerCollectingStatus, () -> Releasables.close(drivers));
-        driverRunner.executeDrivers(
-            task,
-            drivers,
-            transportService.getThreadPool().executor(ESQL_WORKER_THREAD_POOL_NAME),
-            listenerCollectingStatus
-        );
     }
 
     static PhysicalPlan reductionPlan(ExchangeSinkExec plan, boolean enable) {
@@ -609,6 +628,10 @@ public class ComputeService {
 
     String newChildSession(String session) {
         return session + "/" + childSessionIdGenerator.incrementAndGet();
+    }
+
+    String profileDescription(String qualifier, String label) {
+        return qualifier == null ? label : qualifier + "." + label;
     }
 
     Runnable cancelQueryOnFailure(CancellableTask task) {
